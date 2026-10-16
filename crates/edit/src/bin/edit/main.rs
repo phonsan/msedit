@@ -348,6 +348,9 @@ fn draw(tui: &mut Tui, input: Option<input::Input>, state: &mut State) {
     if state.wants_close {
         draw_handle_wants_close(ctx, state);
     }
+    if state.wants_reload {
+        draw_handle_wants_reload(ctx, state);
+    }
     if state.wants_exit {
         draw_handle_wants_exit(ctx, state);
     }
