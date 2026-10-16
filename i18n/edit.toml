@@ -489,6 +489,10 @@ vi = "Đóng tệp"
 zh-hans = "关闭文件"
 zh-hant = "關閉檔案"
 
+[FileReload]
+en = "Reload"
+ja = "開きなおす"
+
 [FileExit]
 en = "Exit"
 ar = "خروج"
@@ -1251,6 +1255,14 @@ uk = "Не зберігати"
 vi = "Không lưu"
 zh-hans = "不保存"
 zh-hant = "不儲存"
+
+[UnsavedChangesReloadDescription]
+en = "Do you want to discard the changes and reload the file?"
+ja = "変更内容を破棄して、ファイルを開きなおしますか？"
+
+[UnsavedChangesReloadYes]
+en = "Discard"
+ja = "破棄する"
 
 [AboutDialogTitle]
 en = "About"

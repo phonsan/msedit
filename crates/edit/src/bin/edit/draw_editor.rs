@@ -302,6 +302,81 @@ pub fn draw_handle_wants_close(ctx: &mut Context, state: &mut State) {
     ctx.needs_rerender();
 }
 
+pub fn draw_handle_wants_reload(ctx: &mut Context, state: &mut State) {
+    let Some(doc) = state.documents.active() else {
+        state.wants_reload = false;
+        return;
+    };
+    if doc.path.is_none() {
+        state.wants_reload = false;
+        return;
+    }
+
+    let mut reload = !doc.buffer.borrow().is_dirty();
+
+    if !reload {
+        let mut cancel = false;
+
+        ctx.modal_begin("unsaved-changes", loc(LocId::UnsavedChangesDialogTitle));
+        ctx.attr_background_rgba(ctx.indexed(IndexedColor::Red));
+        ctx.attr_foreground_rgba(ctx.indexed(IndexedColor::BrightWhite));
+        {
+            let contains_focus = ctx.contains_focus();
+
+            ctx.label("description", loc(LocId::UnsavedChangesReloadDescription));
+            ctx.attr_padding(Rect::three(1, 2, 1));
+
+            ctx.table_begin("choices");
+            ctx.inherit_focus();
+            ctx.attr_padding(Rect::three(0, 2, 1));
+            ctx.attr_position(Position::Center);
+            ctx.table_set_cell_gap(Size { width: 2, height: 0 });
+            {
+                ctx.table_next_row();
+                ctx.inherit_focus();
+
+                if ctx.button(
+                    "discard",
+                    loc(LocId::UnsavedChangesReloadYes),
+                    ButtonStyle::default().accelerator('D'),
+                ) {
+                    reload = true;
+                }
+                if ctx.button("cancel", loc(LocId::Cancel), ButtonStyle::default()) {
+                    cancel = true;
+                }
+                // Focus "Cancel" by default, since discarding is destructive.
+                ctx.inherit_focus();
+
+                // Handle accelerator shortcuts
+                if contains_focus && ctx.consume_shortcut(vk::D) {
+                    reload = true;
+                }
+            }
+            ctx.table_end();
+        }
+        if ctx.modal_end() {
+            cancel = true;
+        }
+
+        if !reload && !cancel {
+            return;
+        }
+    }
+
+    if reload && let Some(doc) = state.documents.active_mut() {
+        // Keep the current encoding, so that files reopened with
+        // an explicit encoding don't fall back to auto-detection.
+        let encoding = doc.buffer.borrow().encoding();
+        if let Err(err) = doc.reread(Some(encoding)) {
+            error_log_add(ctx, state, err);
+        }
+    }
+
+    state.wants_reload = false;
+    ctx.needs_rerender();
+}
+
 pub fn draw_goto_menu(ctx: &mut Context, state: &mut State) {
     let mut done = false;
 
