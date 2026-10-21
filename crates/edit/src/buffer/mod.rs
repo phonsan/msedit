@@ -155,6 +155,10 @@ struct TextHistoryEntry {
     cursor_before: Point,
     /// [`TextBuffer::selection`] before the change was made.
     selection_before: Option<TextBufferSelection>,
+    /// [`TextBuffer::cursor`] position after the change was made.
+    cursor_after: Point,
+    /// [`TextBuffer::selection`] after the change was made.
+    selection_after: Option<TextBufferSelection>,
     /// Logical line count before the change was made.
     logical_lines_before: CoordType,
 }
@@ -2407,6 +2411,7 @@ impl TextBuffer {
 
         if clipboard.is_line_copy() {
             self.cursor_move_to_logical(Point { x: pos.x, y: pos.y + 1 });
+            self.edit_record_after();
         }
     }
 
@@ -2694,6 +2699,7 @@ impl TextBuffer {
         self.set_selection(
             selection.map(|_| TextBufferSelection { beg: selection_beg, end: selection_end }),
         );
+        self.edit_record_after();
     }
 
     fn measure_indent_internal(
@@ -2851,6 +2857,7 @@ impl TextBuffer {
             s.end.y += delta;
             s
         }));
+        self.edit_record_after();
     }
 
     /// Extracts the contents of the current selection.
@@ -2869,6 +2876,7 @@ impl TextBuffer {
             self.edit_delete(end);
             self.edit_end();
             self.set_selection(None);
+            self.edit_record_after();
         }
 
         // Line copies (= Ctrl+C when there's no selection) always end with a newline.
@@ -2983,6 +2991,8 @@ impl TextBuffer {
             let mut entry = TextHistoryEntry {
                 cursor_before: cursor_before.logical_pos,
                 selection_before: self.selection,
+                cursor_after: cursor.logical_pos,
+                selection_after: None,
                 logical_lines_before: self.stats.logical_lines,
                 generation_before: self.buffer.generation(),
                 offset: cursor.offset,
@@ -3102,6 +3112,19 @@ impl TextBuffer {
 
         self.edit_layout_finish();
         self.recalc_after_content_changed();
+        self.edit_record_after();
+    }
+
+    /// Records the current cursor and selection as the state after the most recent change,
+    /// so that redo can restore it. Operations that adjust the cursor or selection after
+    /// their edits are finished need to call this again afterwards.
+    fn edit_record_after(&mut self) {
+        if let Some(entry) = self.undo_stack.last()
+            && let HistoryEntry::Text(entry) = &mut *entry.borrow_mut()
+        {
+            entry.cursor_after = self.cursor.logical_pos;
+            entry.selection_after = self.selection;
+        }
     }
 
     /// Returns the line at the exact edit offset, before any grapheme rounding of the cursor.
@@ -3309,19 +3332,21 @@ impl TextBuffer {
                     // Restore the logical count; visual layout uses the replacement's height delta.
                     mem::swap(&mut self.stats.logical_lines, &mut entry.logical_lines_before);
 
-                    // Restore the previous selection.
-                    mem::swap(&mut self.selection, &mut entry.selection_before);
 
                     // Pretend as if the buffer was never modified.
                     self.buffer.set_generation(entry.generation_before);
                     entry.generation_before = buffer_generation;
 
-                    // Restore the previous cursor.
-                    let cursor_before =
-                        self.cursor_move_to_logical_internal(safe_cursor, entry.cursor_before);
-                    entry.cursor_before = self.cursor.logical_pos;
+                    // Restore the cursor and selection from before (undo) or after (redo) the change.
+                    // Neither depends on where the cursor was when undo/redo was invoked.
+                    let (cursor, selection) = if undo {
+                        (entry.cursor_before, entry.selection_before)
+                    } else {
+                        (entry.cursor_after, entry.selection_after)
+                    };
+                    self.selection = selection;
                     // Can't use `set_cursor_internal` here, because we haven't updated the line stats yet.
-                    self.cursor = cursor_before;
+                    self.cursor = self.cursor_move_to_logical_internal(safe_cursor, cursor);
 
                     true
                 }
@@ -3352,6 +3377,7 @@ impl TextBuffer {
 
         self.highlighter_cache.invalidate_from(damage_start);
         self.recalc_after_content_changed();
+        self.make_cursor_visible();
     }
 
     /// For interfacing with ICU.
@@ -3723,15 +3749,16 @@ mod tests {
 
         let before = buffer_state(&buf);
         buf.write_raw("\u{301}".as_bytes());
+        let after = buffer_state(&buf);
 
         for offset in [0, 9, 10, 11, 13, buf.text_length()] {
             buf.cursor_move_to_offset(offset);
-            let after = buffer_state(&buf);
 
             buf.undo();
             assert_eq!(buffer_state(&buf), before);
             assert_layout(&buf);
 
+            // Redo returns to the edit, regardless of where the cursor was moved to.
             buf.redo();
             assert_eq!(buffer_state(&buf), after);
             assert_layout(&buf);
@@ -3990,10 +4017,12 @@ mod tests {
 
         let first = buffer_state(&buf);
         buf.write_raw(b"prefix\n");
+        let after_first = buffer_state(&buf);
         buf.cursor_move_to_offset(10);
 
         let second = buffer_state(&buf);
         buf.write_raw(b"\nsuffix");
+        let after_second = buffer_state(&buf);
         buf.cursor_move_to_offset(3);
 
         let third = buffer_state(&buf);
@@ -4007,7 +4036,8 @@ mod tests {
             assert_layout(&buf);
         }
 
-        for state in [&second, &third, &last, &last] {
+        // Redo places the cursor where each edit left it, not where the next edit started.
+        for state in [&after_first, &after_second, &last, &last] {
             buf.redo();
             assert_eq!(&buffer_state(&buf), state);
             assert_layout(&buf);
