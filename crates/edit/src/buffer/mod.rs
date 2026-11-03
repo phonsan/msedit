@@ -1221,7 +1221,7 @@ impl TextBuffer {
                 }
                 _ => self.cursor.offset,
             };
-            self.find_select_prev(search, limit);
+            self.find_select_prev(search, limit)?;
             return Ok(());
         }
 
@@ -1238,7 +1238,7 @@ impl TextBuffer {
             }
         };
 
-        self.find_select_next(search, next_search_offset, true);
+        self.find_select_next(search, next_search_offset, true)?;
         Ok(())
     }
 
@@ -1289,7 +1289,12 @@ impl TextBuffer {
         let parsed_replacements = Self::find_parse_replacement(&scratch, &mut search, replacement);
 
         self.edit_begin_grouping();
-        while let Some(range) = self.find_select_next(&mut search, offset, false) {
+        let result = loop {
+            let range = match self.find_select_next(&mut search, offset, false) {
+                Ok(Some(range)) => range,
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
+            };
             let replacement =
                 self.find_fill_replacement(&mut search, replacement, &parsed_replacements);
 
@@ -1310,13 +1315,12 @@ impl TextBuffer {
             if range.is_empty() {
                 offset = match self.find_advance_past_zero_width(offset) {
                     Some(next) => next,
-                    None => break,
+                    None => break Ok(()),
                 };
             }
-        }
-
+        };
         self.edit_end_grouping();
-        Ok(())
+        result
     }
 
     /// After replacing a zero-width match, compute the offset to resume
@@ -1393,7 +1397,7 @@ impl TextBuffer {
         &mut self,
         search: &mut ActiveSearch,
         limit: usize,
-    ) -> Option<Range<usize>> {
+    ) -> icu::Result<Option<Range<usize>>> {
         // Scan the entire buffer from the start. ICU has no backwards search.
         if search.buffer_generation != self.buffer.generation() {
             unsafe { search.regex.set_text(&mut search.text, 0) };
@@ -1404,13 +1408,23 @@ impl TextBuffer {
 
         let mut before = None;
         let mut last = None;
-        while let Some(range) = search.regex.next() {
+        let scan = loop {
+            let range = match search.regex.next() {
+                Ok(Some(range)) => range,
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
+            };
             if range.start < limit {
                 before = Some(range.clone());
             } else if before.is_some() {
-                break;
+                break Ok(());
             }
             last = Some(range);
+        };
+        if let Err(err) = scan {
+            // Put the regex back where forward searches expect it, since the scan moved it.
+            search.regex.reset(search.next_search_offset);
+            return Err(err);
         }
 
         let hit = before.or(last);
@@ -1435,7 +1449,7 @@ impl TextBuffer {
             self.set_selection(None)
         };
 
-        hit
+        Ok(hit)
     }
 
     fn find_select_next(
@@ -1443,7 +1457,7 @@ impl TextBuffer {
         search: &mut ActiveSearch,
         offset: usize,
         wrap: bool,
-    ) -> Option<Range<usize>> {
+    ) -> icu::Result<Option<Range<usize>>> {
         if search.buffer_generation != self.buffer.generation() {
             unsafe { search.regex.set_text(&mut search.text, offset) };
             search.buffer_generation = self.buffer.generation();
@@ -1453,14 +1467,14 @@ impl TextBuffer {
             search.regex.reset(offset);
         }
 
-        let mut hit = search.regex.next();
+        let mut hit = search.regex.next()?;
 
         // If we hit the end of the buffer, and we know that there's something to find,
         // start the search again from the beginning (= wrap around).
         if wrap && hit.is_none() && search.next_search_offset != 0 {
             search.next_search_offset = 0;
             search.regex.reset(0);
-            hit = search.regex.next();
+            hit = search.regex.next()?;
         }
 
         search.selection_generation = if let Some(range) = &hit {
@@ -1483,7 +1497,7 @@ impl TextBuffer {
             self.set_selection(None)
         };
 
-        hit
+        Ok(hit)
     }
 
     fn find_parse_replacement<'a>(
@@ -3332,7 +3346,6 @@ impl TextBuffer {
                     // Restore the logical count; visual layout uses the replacement's height delta.
                     mem::swap(&mut self.stats.logical_lines, &mut entry.logical_lines_before);
 
-
                     // Pretend as if the buffer was never modified.
                     self.buffer.set_generation(entry.generation_before);
                     entry.generation_before = buffer_generation;
@@ -4269,6 +4282,30 @@ mod tests {
         assert_eq!(buffer_write_file_bytes(&mut buf), b"a\nb\n");
     }
 
+    #[test]
+    fn test_replace_all_at_end_of_text() {
+        for (final_newline, expected) in [(false, "FooFoo FooFoo"), (true, "FooFoo FooFoo\n")] {
+            let mut buf = prep_buffer("foo foo");
+            buf.set_insert_final_newline(final_newline);
+
+            let before = buffer_state(&buf);
+            buf.find_and_replace_all("foo", Default::default(), b"FooFoo").unwrap();
+            assert_round_trip(&mut buf, &before, expected);
+        }
+    }
+
+    #[test]
+    fn test_replace_at_end_wraps_to_first_match() {
+        let mut buf = prep_buffer("foo foo");
+        buf.find_and_select("foo", Default::default()).unwrap();
+        buf.find_and_select("foo", Default::default()).unwrap();
+        buf.find_and_replace("foo", Default::default(), b"Foo").unwrap();
+
+        assert_eq!(buffer_stored_bytes(&buf), b"foo Foo");
+        let (beg, end) = buf.selection_range().unwrap();
+        assert_eq!((beg.offset, end.offset), (0, 3));
+    }
+
     // Replacing a zero-width line-end match must advance before searching again, including at the automatic final newline.
     #[test]
     fn test_replace_one_zero_width() {
@@ -4332,5 +4369,40 @@ mod tests {
         assert_eq!(sel_x(&buf), (3, 5));
         buf.find_and_select_prev("ab", opts).unwrap();
         assert_eq!(sel_x(&buf), (0, 2));
+    }
+
+    // Replacing a hit found by searching backwards must replace that hit,
+    // and the following forward search must wrap around to the first match.
+    #[test]
+    fn test_find_prev_then_replace() {
+        let mut buf = prep_buffer("ab ab ab");
+        let opts = SearchOptions::default();
+        buf.cursor_move_to_logical(Point { x: 8, y: 0 });
+
+        buf.find_and_select_prev("ab", opts).unwrap();
+        buf.find_and_replace("ab", opts, b"XYZ").unwrap();
+        assert_eq!(buffer_stored_bytes(&buf), b"ab ab XYZ");
+        let (beg, end) = buf.selection_range().unwrap();
+        assert_eq!((beg.offset, end.offset), (0, 2));
+
+        buf.find_and_select("ab", opts).unwrap();
+        let (beg, end) = buf.selection_range().unwrap();
+        assert_eq!((beg.offset, end.offset), (3, 5));
+    }
+
+    // When the backward scan fails (here: ICU's time limit on catastrophic backtracking),
+    // the next forward search must still continue from the current hit.
+    #[test]
+    fn test_find_prev_error_keeps_forward_position() {
+        let mut buf = prep_buffer(format!("ab ab {}c", "a".repeat(40)));
+        let opts = SearchOptions { use_regex: true, ..Default::default() };
+        let pattern = "(a+)+b";
+
+        buf.find_and_select(pattern, opts).unwrap();
+        assert!(buf.find_and_select_prev(pattern, opts).is_err());
+
+        buf.find_and_select(pattern, opts).unwrap();
+        let (beg, end) = buf.selection_range().unwrap();
+        assert_eq!((beg.offset, end.offset), (3, 5));
     }
 }
