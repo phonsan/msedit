@@ -3346,7 +3346,6 @@ impl TextBuffer {
                     // Restore the logical count; visual layout uses the replacement's height delta.
                     mem::swap(&mut self.stats.logical_lines, &mut entry.logical_lines_before);
 
-
                     // Pretend as if the buffer was never modified.
                     self.buffer.set_generation(entry.generation_before);
                     entry.generation_before = buffer_generation;
