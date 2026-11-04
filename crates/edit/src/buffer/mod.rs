@@ -1408,23 +1408,13 @@ impl TextBuffer {
 
         let mut before = None;
         let mut last = None;
-        let scan = loop {
-            let range = match search.regex.next() {
-                Ok(Some(range)) => range,
-                Ok(None) => break Ok(()),
-                Err(err) => break Err(err),
-            };
+        while let Some(range) = Self::find_regex_next(search)? {
             if range.start < limit {
                 before = Some(range.clone());
             } else if before.is_some() {
-                break Ok(());
+                break;
             }
             last = Some(range);
-        };
-        if let Err(err) = scan {
-            // Put the regex back where forward searches expect it, since the scan moved it.
-            search.regex.reset(search.next_search_offset);
-            return Err(err);
         }
 
         let hit = before.or(last);
@@ -1452,6 +1442,15 @@ impl TextBuffer {
         Ok(hit)
     }
 
+    /// Advances the regex to the next match.
+    ///
+    /// When the search fails (e.g. ICU hits its time limit), the regex is left wherever
+    /// the search stopped. Searches treat `next_search_offset` as the regex's position
+    /// and skip resetting it when the offset is unchanged, so put the regex back there.
+    fn find_regex_next(search: &mut ActiveSearch) -> icu::Result<Option<Range<usize>>> {
+        search.regex.next().inspect_err(|_| search.regex.reset(search.next_search_offset))
+    }
+
     fn find_select_next(
         &mut self,
         search: &mut ActiveSearch,
@@ -1467,14 +1466,14 @@ impl TextBuffer {
             search.regex.reset(offset);
         }
 
-        let mut hit = search.regex.next()?;
+        let mut hit = Self::find_regex_next(search)?;
 
         // If we hit the end of the buffer, and we know that there's something to find,
         // start the search again from the beginning (= wrap around).
         if wrap && hit.is_none() && search.next_search_offset != 0 {
             search.next_search_offset = 0;
             search.regex.reset(0);
-            hit = search.regex.next()?;
+            hit = Self::find_regex_next(search)?;
         }
 
         search.selection_generation = if let Some(range) = &hit {
@@ -4404,5 +4403,22 @@ mod tests {
         buf.find_and_select(pattern, opts).unwrap();
         let (beg, end) = buf.selection_range().unwrap();
         assert_eq!((beg.offset, end.offset), (3, 5));
+    }
+
+    // When a forward search fails (here: ICU's time limit on catastrophic backtracking),
+    // searching again must retry from the same position and fail the same way,
+    // instead of resuming from where the failed search stopped and wrapping around.
+    #[test]
+    fn test_find_next_error_retries_from_same_position() {
+        let mut buf = prep_buffer(format!("ab {}c ab", "a".repeat(40)));
+        let opts = SearchOptions { use_regex: true, ..Default::default() };
+        let pattern = "(a+)+b";
+
+        buf.find_and_select(pattern, opts).unwrap();
+        for _ in 0..2 {
+            assert!(buf.find_and_select(pattern, opts).is_err());
+            let (beg, end) = buf.selection_range().unwrap();
+            assert_eq!((beg.offset, end.offset), (0, 2));
+        }
     }
 }
